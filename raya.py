@@ -168,36 +168,48 @@ class RayaApp:
             self.tell('ИИ и голос ещё не подключены. Вижу: ' + question[:34], 6)
 
     def tick(self):
-        t = self.frame_number
-        # Very gentle breathing: a 6-second cycle and only 2 px total travel.
-        # Real elapsed time avoids frame-dependent speed changes on slower PCs.
-        # Zero-velocity turns at the top and bottom of the sine wave.
-        elapsed = time.monotonic() - self.animation_started
-        bob = round(math.sin(2 * math.pi * elapsed / 6.0)) if self.float_enabled.get() else 0
-        art = self.frames[False]
-        # Tk on Windows removes only pixels exactly matching KEY.
-        # Do NOT alpha-composite on magenta: translucent pixels become purple halos.
-        # Use an opaque foreground with a binary alpha mask for chroma-key output.
-        rgb = Image.new('RGB', (WIDTH, HEIGHT), (255, 0, 255))
-        x = (WIDTH-art.width)//2
-        y = 40 + bob
-        mask = art.getchannel('A').point(lambda a: 255 if a >= 128 else 0)
-        rgb.paste(art.convert('RGB'), (x, y), mask)
-        self.tk_image = ImageTk.PhotoImage(rgb)
-        self.canvas.delete('all')
-        self.canvas.create_image(0, 0, image=self.tk_image, anchor='nw')
-        if self.message and t < self.message_until:
-            self.canvas.create_rectangle(5, 2, WIDTH-5, 44, fill='#141c37', outline='#63bdf9')
-            txt = self.message
-            if len(txt) > 45:
-                txt = txt[:43] + '…'
-            self.canvas.create_text(WIDTH//2, 23, text=txt, fill='#e8f5ff',
-                                    font=('Segoe UI', 9))
-        else:
-            self.message = ''
-        self.frame_number += 1
-        self.root.after(33, self.tick)
+        # Create chroma-key image once, not on every animation frame.
+        if not hasattr(self, '_cached_avatar'):
+            art = self.frames[False]
+            rgb = Image.new('RGB', (WIDTH, HEIGHT), (255, 0, 255))
+            x = (WIDTH - art.width) // 2
+            # Preserve exact-color transparency without purple halo.
+            mask = art.getchannel('A').point(lambda a: 255 if a >= 128 else 0)
+            rgb.paste(art.convert('RGB'), (x, 40), mask)
+            self._cached_avatar = ImageTk.PhotoImage(rgb)
+            self._avatar_item = self.canvas.create_image(
+                0, 0, image=self._cached_avatar, anchor='nw', tags='avatar'
+            )
+            self._last_bob = None
+            self._bubble_items = []
 
+        elapsed = time.monotonic() - self.animation_started
+        # 8-second cycle, +/-4 px. No large per-frame jumps.
+        bob = round(4 * math.sin(2 * math.pi * elapsed / 8.0)) if self.float_enabled.get() else 0
+        if bob != self._last_bob:
+            self.canvas.coords(self._avatar_item, 0, bob)
+            self._last_bob = bob
+
+        # Update hint bubble only when its content or visibility changes.
+        show_message = self.message and self.frame_number < self.message_until
+        content = (self.message[:43] + '…' if len(self.message) > 45 else self.message) if show_message else ''
+        if getattr(self, '_shown_message', None) != content:
+            for item in self._bubble_items:
+                self.canvas.delete(item)
+            self._bubble_items.clear()
+            self._shown_message = content
+            if content:
+                self._bubble_items.append(self.canvas.create_rectangle(
+                    5, 2, WIDTH-5, 44, fill='#141c37', outline='#63bdf9'
+                ))
+                self._bubble_items.append(self.canvas.create_text(
+                    WIDTH//2, 23, text=content, fill='#e8f5ff', font=('Segoe UI', 9)
+                ))
+        if not show_message:
+            self.message = ''
+
+        self.frame_number += 1
+        self.root.after(16, self.tick)
     def run(self):
         self.root.mainloop()
 
