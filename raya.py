@@ -1,4 +1,4 @@
-"""Raya Prime v0.2.3 — stable-window avatar and embedded Ollama chat.
+"""Raya Prime v0.3 — stable-window avatar, embedded chat and optional voice.
 
 Windows 11 / PySide6. One frameless top-level window: chat is a child
 widget docked next to Raya, not a separate operating-system window.
@@ -17,6 +17,7 @@ from pathlib import Path
 from PySide6.QtCore import QByteArray, QPoint, QRect, QRectF, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPixmap, QRegion
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from voice import VoiceController, SpeechSynthesizer
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -144,6 +145,9 @@ class EmbeddedChat(QWidget):
         self.send_button.clicked.connect(self.send_message)
         entry.addWidget(self.send_button)
         layout.addLayout(entry)
+        self.mic_button = QPushButton("🎙 Сказать команду", self)
+        self.mic_button.clicked.connect(self.avatar.toggle_microphone)
+        layout.addWidget(self.mic_button)
 
         self.status = QLabel("Локальная модель: raya-prime", self)
         self.status.setWordWrap(True)
@@ -169,9 +173,13 @@ class EmbeddedChat(QWidget):
         self.input.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def send_message(self):
+        self.send_text(self.input.text().strip())
+
+    def send_text(self, question):
         if self.pending is not None:
+            self.avatar.tell("Подожди, я ещё думаю…", 3)
             return
-        question = self.input.text().strip()
+        question = question.strip()
         if not question:
             return
         self.input.clear()
@@ -228,6 +236,7 @@ class EmbeddedChat(QWidget):
             self.status.setText("Райя на связи  ·  локальный ИИ")
             self.avatar.tell("Ответила", 2)
             logger.info("Ollama response received (%d characters)", len(answer))
+            self.avatar.say(answer)
         finally:
             reply.deleteLater()
 
@@ -273,13 +282,20 @@ class RayaAvatar(QWidget):
         self.drag_offset = None
         self.was_dragged = False
         self.started_at = time.perf_counter()
+        self.voice = VoiceController(self)
+        self.voice.recognized.connect(self._voice_recognized)
+        self.voice.status_changed.connect(self._voice_status)
+        self.voice.error.connect(self._voice_error)
+        self.tts = SpeechSynthesizer(self)
+        self.voice_mode = "off"
+        self.tts_enabled = bool(self.settings.get("tts_enabled", True))
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.update)
         self.timer.start(16)
         self._update_hit_region()
-        logger.info("Starting Raya Prime v0.2.3, fixed compositor surface, voice not connected")
+        logger.info("Starting Raya Prime v0.3, optional microphone + Windows speech")
 
     def avatar_origin(self):
         """Location of Raya's image region on the desktop (not panel origin)."""
@@ -400,6 +416,46 @@ class RayaAvatar(QWidget):
             else:
                 self.hide_chat()
 
+    def toggle_microphone(self):
+        if self.voice.isRunning():
+            self.voice.stop()
+            self.voice_mode = "off"
+            self.tell("Микрофон выключен", 3)
+        else:
+            self._start_voice("once")
+
+    def _start_voice(self, mode):
+        self.voice_mode = mode
+        if not self.voice.start_listening(mode):
+            self.voice_mode = "off"
+            self.tell("Нужна модель Vosk в models/ru", 5)
+        else:
+            self.tell("Слушаю…" if mode == "once" else "Жду обращения «Райя»", 4)
+
+    def _voice_status(self, status):
+        if self.chat is not None:
+            self.chat.mic_button.setText("■ Выключить микрофон" if status == "listening" else "🎙 Сказать команду")
+
+    def _voice_error(self, problem):
+        logger.error("Speech recognition error: %s", problem)
+        self.tell("Ошибка микрофона — см. logs/raya.log", 6)
+        self.voice_mode = "off"
+
+    def _voice_recognized(self, phrase):
+        logger.info("Voice command recognized (content omitted)")
+        # Avoid recording the assistant's synthetic reply as a new command.
+        self.voice.stop()
+        self.voice_mode = "off"
+        if self.chat is None:
+            self.chat = EmbeddedChat(self)
+            self.chat.setGeometry(self.panel_x, 8, CHAT_WIDTH, AVATAR_HEIGHT - 16)
+        self.chat.send_text(phrase)
+        self.tell("Услышала команду", 3)
+
+    def say(self, text):
+        if self.tts_enabled:
+            self.tts.speak(text)
+
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         open_action = menu.addAction("Показать / скрыть встроенный чат")
@@ -411,6 +467,14 @@ class RayaAvatar(QWidget):
         breathe_action = menu.addAction("Плавное дыхание")
         breathe_action.setCheckable(True)
         breathe_action.setChecked(self.float_enabled)
+        menu.addSeparator()
+        once_action = menu.addAction("🎙 Слушать одну команду")
+        wake_action = menu.addAction("Активация по имени «Райя»")
+        wake_action.setCheckable(True)
+        wake_action.setChecked(self.voice.isRunning() and self.voice_mode == "wake")
+        mute_action = menu.addAction("Озвучивать ответы")
+        mute_action.setCheckable(True)
+        mute_action.setChecked(self.tts_enabled)
         menu.addSeparator()
         logs_action = menu.addAction("Открыть папку логов")
         exit_action = menu.addAction("Выход")
@@ -429,6 +493,22 @@ class RayaAvatar(QWidget):
         elif action == breathe_action:
             self.float_enabled = breathe_action.isChecked()
             self.save_state()
+        elif action == once_action:
+            self.voice.stop()
+            self._start_voice("once")
+        elif action == wake_action:
+            if wake_action.isChecked():
+                self.voice.stop()
+                self._start_voice("wake")
+            else:
+                self.voice.stop()
+                self.voice_mode = "off"
+                self.tell("Ожидание имени выключено", 3)
+        elif action == mute_action:
+            self.tts_enabled = mute_action.isChecked()
+            if not self.tts_enabled:
+                self.tts.stop()
+            self.save_state()
         elif action == logs_action:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
             if sys.platform == "win32":
@@ -443,6 +523,7 @@ class RayaAvatar(QWidget):
             "y": position.y(),
             "float_enabled": self.float_enabled,
             "text_chat_enabled": self.text_chat_enabled,
+            "tts_enabled": self.tts_enabled,
         })
         save_settings(self.settings)
 
@@ -453,6 +534,8 @@ class RayaAvatar(QWidget):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        self.voice.stop()
+        self.tts.stop()
         self.save_state()
         logger.info("Raya Prime closed")
         super().closeEvent(event)
