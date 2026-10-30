@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .env
 .venv/
+
+fix_animation.py
+raya.py.bak
