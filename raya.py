@@ -1,36 +1,35 @@
-"""Raya Prime desktop 2D avatar prototype, Windows 11.
-
-This is an animation/window prototype, not yet an AI agent.
-"""
-import math
-import time
+"""Raya Prime — gentle breathing animation, without pixel-stepping bobbing."""
 import json
 import logging
+import math
+import os
+import sys
+import time
 from logging.handlers import RotatingFileHandler
-import tkinter as tk
-from tkinter import simpledialog
 from pathlib import Path
 
-from PIL import Image, ImageTk
+from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPixmap
+from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QWidget
 
 BASE_DIR = Path(__file__).resolve().parent
 ART = BASE_DIR / 'assets' / 'raya.png'
-KEY = '#ff00ff'
-WIDTH, HEIGHT = 345, 470
 DATA_DIR = BASE_DIR / 'data'
 LOG_DIR = BASE_DIR / 'logs'
 SETTINGS_PATH = DATA_DIR / 'settings.json'
+WIDTH, HEIGHT = 345, 470
 
 
 def setup_logging():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger('raya')
-    logger.setLevel(logging.INFO)
-    handler = RotatingFileHandler(LOG_DIR / 'raya.log', maxBytes=1_000_000,
-                                  backupCount=3, encoding='utf-8')
-    handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
-    logger.addHandler(handler)
-    return logger
+    log = logging.getLogger('raya')
+    log.setLevel(logging.INFO)
+    if not log.handlers:
+        handler = RotatingFileHandler(LOG_DIR / 'raya.log', maxBytes=1_000_000,
+                                      backupCount=3, encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+        log.addHandler(handler)
+    return log
 
 
 logger = setup_logging()
@@ -38,185 +37,161 @@ logger = setup_logging()
 
 def load_settings():
     try:
-        if SETTINGS_PATH.exists():
-            result = json.loads(SETTINGS_PATH.read_text(encoding='utf-8'))
-            if isinstance(result, dict):
-                return result
+        if SETTINGS_PATH.is_file():
+            value = json.loads(SETTINGS_PATH.read_text(encoding='utf-8'))
+            return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
-        logger.exception('Failed to read settings; using defaults')
+        logger.exception('Could not load settings')
     return {}
 
 
-def save_settings(settings):
+def save_settings(data):
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        temp = SETTINGS_PATH.with_suffix('.tmp')
-        temp.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding='utf-8')
-        temp.replace(SETTINGS_PATH)
+        tmp = SETTINGS_PATH.with_suffix('.tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        tmp.replace(SETTINGS_PATH)
     except OSError:
-        logger.exception('Failed to save settings')
+        logger.exception('Could not save settings')
 
 
-
-class RayaApp:
+class RayaAvatar(QWidget):
     def __init__(self):
+        super().__init__()
         self.settings = load_settings()
-        logger.info('Starting Raya Prime v0.1.4')
-        self.root = tk.Tk()
-        self.root.report_callback_exception = self.on_callback_error
-        self.root.title('Raya Prime — prototype')
-        self.root.overrideredirect(True)
-        self.root.wm_attributes('-topmost', True)
-        self.root.configure(bg=KEY)
-        # Windows supports a transparent chroma-keyed window.
-        self.root.wm_attributes('-transparentcolor', KEY)
-        x = int(self.settings.get('x', 100))
-        y = int(self.settings.get('y', 150))
-        self.root.geometry(f'{WIDTH}x{HEIGHT}+{x}+{y}')
-        self.canvas = tk.Canvas(self.root, width=WIDTH, height=HEIGHT,
-                                bg=KEY, highlightthickness=0, bd=0)
-        self.canvas.pack()
-        self.image = Image.open(ART).convert('RGBA')
-        self.image.thumbnail((WIDTH-12, HEIGHT-52), Image.Resampling.LANCZOS)
-        self.frames = self.make_frames()
-        self.tk_image = None
-        self.start_x = self.start_y = 0
-        self.dragging = False
-        self.frame_number = 0
-        self.animation_started = time.monotonic()
-        self.float_enabled = tk.BooleanVar(value=bool(self.settings.get('float_enabled', True)))
+        self.setWindowTitle('Raya Prime')
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.WindowStaysOnTopHint |
+                            Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedSize(WIDTH, HEIGHT)
+        self.move(int(self.settings.get('x', 100)), int(self.settings.get('y', 150)))
+        if not ART.is_file():
+            raise FileNotFoundError(f'Avatar image is missing: {ART}')
+        self.pixmap = QPixmap(str(ART))
+        if self.pixmap.isNull():
+            raise RuntimeError(f'Cannot load avatar image: {ART}')
+        # Keep full-resolution pixels for resampling at fractional geometry.
+        original = self.pixmap.size()
+        fit = min((WIDTH - 20) / original.width(),
+                  (HEIGHT - 60) / original.height())
+        self.draw_width = original.width() * fit
+        self.draw_height = original.height() * fit
+        self.float_enabled = bool(self.settings.get('float_enabled', True))
         self.message = ''
-        self.message_until = 0
-        self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label='Поговорить с Райей (демо)', command=self.demo)
-        self.menu.add_command(label='Скрыть подсказку', command=self.clear_message)
-        self.menu.add_checkbutton(label='Плавное покачивание', variable=self.float_enabled)
-        self.menu.add_separator()
-        self.menu.add_command(label='Открыть папку логов', command=self.open_logs)
-        self.menu.add_command(label='Выход', command=self.close)
-        self.canvas.bind('<ButtonPress-1>', self.mouse_down)
-        self.canvas.bind('<B1-Motion>', self.mouse_move)
-        self.canvas.bind('<ButtonRelease-1>', self.mouse_up)
-        self.canvas.bind('<Button-3>', self.context_menu)
-        self.root.bind('<Escape>', lambda _: self.close())
-        self.root.protocol('WM_DELETE_WINDOW', self.close)
-        self.float_enabled.trace_add('write', lambda *_: self.save_state())
-        self.tick()
+        self.message_expires = 0.0
+        self.drag_offset = None
+        self.was_dragged = False
+        self.start = time.perf_counter()
+        self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(16)  # target ~60 repaints/s (not guaranteed)
+        logger.info('Starting Raya Prime Qt renderer')
 
-    def on_callback_error(self, exc_type, exc_value, exc_tb):
-        logger.error('Unhandled UI callback error', exc_info=(exc_type, exc_value, exc_tb))
-        try:
-            self.tell('Ошибка. Подробности в logs/raya.log', 6)
-        except Exception:
-            pass
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        elapsed = time.perf_counter() - self.start
+        # No vertical bobbing: at this size it looks like pixel stepping.
+        # Instead gently scale around a fixed bottom anchor every 8 seconds.
+        wave = math.sin(2.0 * math.pi * elapsed / 8.0)
+        scale = 1.0 + (0.0045 * wave if self.float_enabled else 0.0)
+        draw_w = self.draw_width * scale
+        draw_h = self.draw_height * scale
+        x = (WIDTH - draw_w) / 2.0
+        bottom = 40.0 + self.draw_height
+        y = bottom - draw_h
+        painter.drawPixmap(QRectF(x, y, draw_w, draw_h),
+                           self.pixmap, QRectF(self.pixmap.rect()))
+        if self.message and time.perf_counter() < self.message_expires:
+            painter.setPen(QColor('#63bdf9'))
+            painter.setBrush(QColor('#141c37'))
+            painter.drawRoundedRect(QRectF(5, 2, WIDTH - 10, 42), 8, 8)
+            painter.setPen(QColor('#e8f5ff'))
+            painter.setFont(QFont('Segoe UI', 9))
+            text = self.message if len(self.message) <= 45 else self.message[:43] + '…'
+            painter.drawText(QRectF(9, 2, WIDTH - 18, 42), Qt.AlignmentFlag.AlignCenter, text)
+        painter.end()
+
+    def tell(self, text, seconds=4):
+        self.message = text
+        self.message_expires = time.perf_counter() + seconds
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_offset = event.globalPosition().toPoint() - self.pos()
+            self.drag_start = event.globalPosition().toPoint()
+            self.was_dragged = False
+
+    def mouseMoveEvent(self, event):
+        if self.drag_offset is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            current = event.globalPosition().toPoint()
+            if (current - self.drag_start).manhattanLength() > 3:
+                self.was_dragged = True
+            self.move(current - self.drag_offset)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_offset = None
+            if self.was_dragged:
+                self.save_state()
+            else:
+                self.tell('Привет! Я Райя. Пока я — анимированный прототип ✨')
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        talk = menu.addAction('Поговорить с Райей (демо)')
+        hide = menu.addAction('Скрыть подсказку')
+        bob_action = menu.addAction('Мягкое дыхание (без покачивания)')
+        bob_action.setCheckable(True)
+        bob_action.setChecked(self.float_enabled)
+        menu.addSeparator()
+        logs = menu.addAction('Открыть папку логов')
+        exit_action = menu.addAction('Выход')
+        chosen = menu.exec(event.globalPos())
+        if chosen == talk:
+            value, ok = QInputDialog.getText(self, 'Райя — демонстрация', 'Напиши сообщение:')
+            if ok:
+                self.tell('ИИ и голос ещё не подключены. Вижу: ' + value[:34], 6)
+        elif chosen == hide:
+            self.message = ''
+            self.update()
+        elif chosen == bob_action:
+            self.float_enabled = bob_action.isChecked()
+            self.save_state()
+        elif chosen == logs:
+            os.startfile(str(LOG_DIR))
+        elif chosen == exit_action:
+            self.close()
 
     def save_state(self):
-        if not self.root.winfo_exists():
-            return
-        save_settings({'x': self.root.winfo_x(), 'y': self.root.winfo_y(),
-                       'float_enabled': self.float_enabled.get()})
+        save_settings({'x': self.x(), 'y': self.y(),
+                       'float_enabled': self.float_enabled})
 
-    def open_logs(self):
-        import os
-        os.startfile(str(LOG_DIR))  # Windows only
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
 
-    def close(self):
+    def closeEvent(self, event):
         self.save_state()
         logger.info('Raya Prime closed')
-        self.root.destroy()
+        super().closeEvent(event)
 
-    def make_frames(self):
-        # Until we have independently layered eyes/eyelids, do not draw
-        # guessed blink lines over the face: these can cross the eyebrows.
-        return {False: self.image.copy()}
 
-    def tell(self, line, secs=4):
-        self.message = line
-        self.message_until = self.frame_number + int(secs*30)
-
-    def clear_message(self):
-        self.message = ''
-
-    def mouse_down(self, event):
-        self.start_x, self.start_y = event.x_root, event.y_root
-        self.dragging = False
-
-    def mouse_move(self, event):
-        dx = event.x_root-self.start_x
-        dy = event.y_root-self.start_y
-        if abs(dx)+abs(dy) > 3:
-            self.dragging = True
-        self.root.geometry(f'+{self.root.winfo_x()+dx}+{self.root.winfo_y()+dy}')
-        self.start_x, self.start_y = event.x_root, event.y_root
-
-    def mouse_up(self, event):
-        if self.dragging:
-            self.save_state()
-        if not self.dragging:
-            self.tell('Привет! Я Райя. Сейчас я — анимированный прототип ✨')
-
-    def context_menu(self, event):
-        try:
-            self.menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.menu.grab_release()
-
-    def demo(self):
-        question = simpledialog.askstring('Райя — демонстрация',
-                                          'Напиши сообщение:', parent=self.root)
-        if question is not None:
-            self.tell('ИИ и голос ещё не подключены. Вижу: ' + question[:34], 6)
-
-    def tick(self):
-        # Create chroma-key image once, not on every animation frame.
-        if not hasattr(self, '_cached_avatar'):
-            art = self.frames[False]
-            rgb = Image.new('RGB', (WIDTH, HEIGHT), (255, 0, 255))
-            x = (WIDTH - art.width) // 2
-            # Preserve exact-color transparency without purple halo.
-            mask = art.getchannel('A').point(lambda a: 255 if a >= 128 else 0)
-            rgb.paste(art.convert('RGB'), (x, 40), mask)
-            self._cached_avatar = ImageTk.PhotoImage(rgb)
-            self._avatar_item = self.canvas.create_image(
-                0, 0, image=self._cached_avatar, anchor='nw', tags='avatar'
-            )
-            self._last_bob = None
-            self._bubble_items = []
-
-        elapsed = time.monotonic() - self.animation_started
-        # 8-second cycle, +/-4 px. No large per-frame jumps.
-        bob = round(4 * math.sin(2 * math.pi * elapsed / 8.0)) if self.float_enabled.get() else 0
-        if bob != self._last_bob:
-            self.canvas.coords(self._avatar_item, 0, bob)
-            self._last_bob = bob
-
-        # Update hint bubble only when its content or visibility changes.
-        show_message = self.message and self.frame_number < self.message_until
-        content = (self.message[:43] + '…' if len(self.message) > 45 else self.message) if show_message else ''
-        if getattr(self, '_shown_message', None) != content:
-            for item in self._bubble_items:
-                self.canvas.delete(item)
-            self._bubble_items.clear()
-            self._shown_message = content
-            if content:
-                self._bubble_items.append(self.canvas.create_rectangle(
-                    5, 2, WIDTH-5, 44, fill='#141c37', outline='#63bdf9'
-                ))
-                self._bubble_items.append(self.canvas.create_text(
-                    WIDTH//2, 23, text=content, fill='#e8f5ff', font=('Segoe UI', 9)
-                ))
-        if not show_message:
-            self.message = ''
-
-        self.frame_number += 1
-        self.root.after(16, self.tick)
-    def run(self):
-        self.root.mainloop()
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+    avatar = RayaAvatar()
+    avatar.show()
+    return app.exec()
 
 
 if __name__ == '__main__':
     try:
-        RayaApp().run()
+        sys.exit(main())
     except Exception:
         logger.exception('Fatal Raya Prime error')
         raise
